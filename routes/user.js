@@ -1,3 +1,24 @@
+/**
+ * 用户路由模块 (/api/v1/users)
+ *
+ * 提供完整的用户信息管理和个人设置功能：
+ * - GET    /me/complete               → 获取当前用户完整信息（含作品列表）
+ * - PUT    /me/profile                → 更新用户资料（昵称、头像、性别、生日、城市、签名等）
+ * - GET    /me/settings               → 获取隐私和通知设置
+ * - PUT    /me/settings               → 更新隐私设置
+ * - GET    /me/devices                → 获取登录设备列表
+ * - POST   /me/devices/:deviceId/revoke → 注销指定设备会话
+ * - GET    /me/blacklist              → 获取黑名单列表
+ * - POST   /me/blacklist              → 添加用户到黑名单
+ * - DELETE /me/blacklist/:targetUserId → 从黑名单移除用户
+ * - POST   /me/works                  → 创建用户作品
+ * - DELETE /me/works/:workId          → 删除用户作品
+ * - POST   /me/cancel                 → 注销账号（软删除，7天冷却期）
+ * - GET    /:userId                   → 查看其他用户公开信息
+ *
+ * 所有 /me/* 接口均需登录认证，查看他人信息接口无需认证
+ */
+
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 
@@ -11,6 +32,7 @@ const {
 
 const router = express.Router();
 
+/** 获取当前登录用户的完整信息（包含关联的作品列表） */
 router.get('/me/complete', authenticateToken, async (req, res) => {
   await db.ready;
   const user = await loadUserWithWorks(req.auth.userId);
@@ -21,6 +43,14 @@ router.get('/me/complete', authenticateToken, async (req, res) => {
   res.json({ user });
 });
 
+/**
+ * 更新用户资料
+ * 支持的字段：name / avatarKey / gender / birthYear / birthMonth / city / signature / introVideoTitle / introVideoSummary
+ * 特殊逻辑：
+ * - 修改头像后自动重置人脸认证状态（需要重新认证）
+ * - 性别只能在"未设置"状态下修改一次
+ * - 可同步更新作品列表（先删除旧作品再批量插入）
+ */
 router.put('/me/profile', authenticateToken, async (req, res) => {
   await db.ready;
   const current = await db.get('SELECT * FROM users WHERE id = ?', [req.auth.userId]);
@@ -29,6 +59,7 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
     return;
   }
 
+  /* 动态构建 UPDATE 语句 */
   const updates = [];
   const values = [];
   const now = new Date().toISOString();
@@ -40,12 +71,14 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
   if (typeof req.body.name === 'string' && req.body.name.trim().length > 0) {
     assign('name', req.body.name.trim());
   }
+  /* 更换头像后需要重新进行人脸认证 */
   if (typeof req.body.avatarKey === 'string' && req.body.avatarKey.trim()) {
     assign('avatar_key', req.body.avatarKey.trim());
     assign('face_status', 'notStarted');
     assign('face_match_score', null);
     assign('face_verified_at', null);
   }
+  /* 性别仅在未设置时可修改 */
   if (typeof req.body.gender === 'string' && current.gender === 'undisclosed') {
     assign('gender', req.body.gender);
   }
@@ -77,6 +110,7 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
     );
   }
 
+  /* 同步更新作品列表（全量替换） */
   if (Array.isArray(req.body.works)) {
     await db.run('DELETE FROM user_works WHERE user_id = ?', [req.auth.userId]);
     for (const work of req.body.works) {
@@ -105,6 +139,7 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
   });
 });
 
+/** 获取当前用户的隐私和通知设置 */
 router.get('/me/settings', authenticateToken, async (req, res) => {
   await db.ready;
   const privacy = await db.get(
@@ -129,6 +164,7 @@ router.get('/me/settings', authenticateToken, async (req, res) => {
   });
 });
 
+/** 更新聊天隐私设置（好友可见、广场曝光、优先已认证用户） */
 router.put('/me/settings', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -145,6 +181,7 @@ router.put('/me/settings', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 获取当前用户的登录设备会话列表 */
 router.get('/me/devices', authenticateToken, async (req, res) => {
   await db.ready;
   const devices = await db.all(
@@ -156,6 +193,7 @@ router.get('/me/devices', authenticateToken, async (req, res) => {
   });
 });
 
+/** 注销指定设备会话（用于踢出其他设备） */
 router.post('/me/devices/:deviceId/revoke', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -165,6 +203,7 @@ router.post('/me/devices/:deviceId/revoke', authenticateToken, async (req, res) 
   res.json({ success: true });
 });
 
+/** 获取当前用户的黑名单列表（包含被拉黑用户的昵称） */
 router.get('/me/blacklist', authenticateToken, async (req, res) => {
   await db.ready;
   const list = await db.all(
@@ -177,6 +216,7 @@ router.get('/me/blacklist', authenticateToken, async (req, res) => {
   res.json({ entries: list });
 });
 
+/** 添加用户到黑名单 */
 router.post('/me/blacklist', authenticateToken, async (req, res) => {
   await db.ready;
   if (!req.body.targetUserId) {
@@ -190,6 +230,7 @@ router.post('/me/blacklist', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 从黑名单移除用户 */
 router.delete('/me/blacklist/:targetUserId', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -199,6 +240,7 @@ router.delete('/me/blacklist/:targetUserId', authenticateToken, async (req, res)
   res.json({ success: true });
 });
 
+/** 创建用户作品（图片/视频/语音等） */
 router.post('/me/works', authenticateToken, async (req, res) => {
   await db.ready;
   const workId = uuidv4();
@@ -224,6 +266,7 @@ router.post('/me/works', authenticateToken, async (req, res) => {
   res.status(201).json({ work: formatWorkRow(work) });
 });
 
+/** 删除指定作品 */
 router.delete('/me/works/:workId', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -233,6 +276,10 @@ router.delete('/me/works/:workId', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/**
+ * 注销账号（软删除）
+ * 设置 deleted_at 时间戳并标记离线，返回 7 天冷却期结束时间
+ */
 router.post('/me/cancel', authenticateToken, async (req, res) => {
   await db.ready;
   const now = new Date().toISOString();
@@ -246,6 +293,10 @@ router.post('/me/cancel', authenticateToken, async (req, res) => {
   });
 });
 
+/**
+ * 查看其他用户的公开信息
+ * 无需认证，返回基本资料和作品列表
+ */
 router.get('/:userId', async (req, res) => {
   await db.ready;
   const user = await db.get(
@@ -283,6 +334,7 @@ router.get('/:userId', async (req, res) => {
   });
 });
 
+/** 加载用户信息及其关联的作品列表，自动补充脱敏手机号 */
 async function loadUserWithWorks(userId) {
   const row = await db.get('SELECT * FROM users WHERE id = ?', [userId]);
   if (!row) {

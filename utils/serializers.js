@@ -1,3 +1,18 @@
+/**
+ * 数据序列化工具模块
+ *
+ * 将数据库原始行对象（snake_case 字段）转换为 API 返回格式（camelCase 字段），
+ * 并提供手机号和身份证号的脱敏处理函数。
+ *
+ * 导出函数：
+ * - formatUserRow(row, works)     → 格式化用户信息
+ * - formatWorkRow(row)            → 格式化用户作品
+ * - formatConversationRow(row)    → 格式化聊天会话
+ * - formatMessageRow(row)         → 格式化聊天消息
+ * - maskPhoneNumber(value)        → 手机号脱敏（139****0001）
+ * - maskIdNumber(value)           → 身份证号脱敏（3101********1208）
+ */
+
 function formatUserRow(row, works = []) {
   return {
     id: row.id,

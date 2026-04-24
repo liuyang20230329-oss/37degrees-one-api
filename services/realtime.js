@@ -1,3 +1,13 @@
+/**
+ * 实时通信服务 - WebSocket 管理
+ *
+ * 职责：
+ * - 在 HTTP 服务器上拦截 /ws/chat 的 upgrade 请求，建立 WebSocket 连接
+ * - 通过 URL 参数中的 JWT token 鉴别用户身份
+ * - 维护 userId → WebSocket 客户端集合的映射，支持同一用户多设备同时在线
+ * - 提供 pushToUser 方法，向指定用户的所有活跃连接推送实时消息
+ */
+
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const jwt = require('jsonwebtoken');

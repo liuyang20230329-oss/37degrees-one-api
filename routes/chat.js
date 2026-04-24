@@ -1,3 +1,21 @@
+/**
+ * 聊天路由模块 (/api/v1/chat)
+ *
+ * 提供完整的聊天会话和消息管理功能：
+ * - GET    /conversations                        → 获取当前用户的会话列表
+ * - POST   /conversations                        → 创建新会话
+ * - PATCH  /conversations/:conversationId/pin    → 切换会话置顶状态
+ * - POST   /conversations/read-all               → 全部标记已读
+ * - POST   /conversations/:conversationId/read   → 标记单个会话已读
+ * - DELETE /conversations/:conversationId         → 删除会话
+ * - GET    /messages/:conversationId             → 获取会话消息列表
+ * - POST   /messages                             → 发送消息（支持多种类型，自动生成模拟回复）
+ * - GET    /privacy                              → 获取聊天隐私设置
+ * - PUT    /privacy                              → 更新聊天隐私设置
+ *
+ * 所有接口均需登录认证
+ */
+
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 
@@ -11,6 +29,7 @@ const {
 
 const router = express.Router();
 
+/** 获取当前用户的会话列表，首次访问时自动创建种子会话 */
 router.get('/conversations', authenticateToken, async (req, res) => {
   await db.ready;
   await ensureSeedConversations(req.auth.userId);
@@ -25,6 +44,7 @@ router.get('/conversations', authenticateToken, async (req, res) => {
   });
 });
 
+/** 创建新会话：插入会话记录、创建者成员、系统初始消息，并通过 WebSocket 通知客户端 */
 router.post('/conversations', authenticateToken, async (req, res) => {
   await db.ready;
   const now = new Date().toISOString();
@@ -72,6 +92,7 @@ router.post('/conversations', authenticateToken, async (req, res) => {
   });
 });
 
+/** 切换会话的置顶/取消置顶状态 */
 router.patch('/conversations/:conversationId/pin', authenticateToken, async (req, res) => {
   await db.ready;
   const current = await db.get(
@@ -93,6 +114,7 @@ router.patch('/conversations/:conversationId/pin', authenticateToken, async (req
   res.json({ success: true });
 });
 
+/** 将当前用户所有会话标记为已读 */
 router.post('/conversations/read-all', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -103,6 +125,7 @@ router.post('/conversations/read-all', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 将指定会话标记为已读 */
 router.post('/conversations/:conversationId/read', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -116,6 +139,7 @@ router.post('/conversations/:conversationId/read', authenticateToken, async (req
   res.json({ success: true });
 });
 
+/** 删除指定会话（级联删除关联的消息和成员记录） */
 router.delete('/conversations/:conversationId', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -129,6 +153,7 @@ router.delete('/conversations/:conversationId', authenticateToken, async (req, r
   res.json({ success: true });
 });
 
+/** 获取指定会话的全部消息记录 */
 router.get('/messages/:conversationId', authenticateToken, async (req, res) => {
   await db.ready;
   const conversation = await db.get(
@@ -151,6 +176,14 @@ router.get('/messages/:conversationId', authenticateToken, async (req, res) => {
   });
 });
 
+/**
+ * 发送消息：
+ * 1. 校验会话和用户状态
+ * 2. 非系统会话需要完成手机号认证才能发私聊
+ * 3. 插入消息记录并更新会话预览
+ * 4. 根据会话类型生成模拟自动回复
+ * 5. 通过 WebSocket 推送实时通知
+ */
 router.post('/messages', authenticateToken, async (req, res) => {
   await db.ready;
   const conversationId = req.body.conversationId;
@@ -185,6 +218,7 @@ router.post('/messages', authenticateToken, async (req, res) => {
     return;
   }
 
+  /* 插入用户发送的消息 */
   const now = new Date();
   const messageId = uuidv4();
   await db.run(
@@ -209,6 +243,7 @@ router.post('/messages', authenticateToken, async (req, res) => {
     [buildPreview(type, text), now.toISOString(), conversationId],
   );
 
+  /* 生成模拟自动回复 */
   const reply = buildAutoReply(conversationId, type);
   if (reply) {
     const replyTime = new Date(now.getTime() + 1000).toISOString();
@@ -247,6 +282,7 @@ router.post('/messages', authenticateToken, async (req, res) => {
   });
 });
 
+/** 获取当前用户的聊天隐私设置 */
 router.get('/privacy', authenticateToken, async (req, res) => {
   await db.ready;
   const settings = await db.get(
@@ -262,6 +298,7 @@ router.get('/privacy', authenticateToken, async (req, res) => {
   });
 });
 
+/** 更新聊天隐私设置（好友可见、广场曝光、优先已认证用户） */
 router.put('/privacy', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -278,6 +315,10 @@ router.put('/privacy', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/**
+ * 确保新用户拥有初始种子会话
+ * 首次访问会话列表时，自动创建 5 个预设会话（向导、私聊、热聊群、关注者、关注中）
+ */
 async function ensureSeedConversations(userId) {
   const exists = await db.get(
     'SELECT id FROM chat_conversations WHERE user_id = ? LIMIT 1',
@@ -342,6 +383,7 @@ async function ensureSeedConversations(userId) {
   }
 }
 
+/** 根据种子会话类型返回预设的初始消息文本 */
 function seedPreview(seedKey) {
   switch (seedKey) {
     case 'concierge':
@@ -357,6 +399,7 @@ function seedPreview(seedKey) {
   }
 }
 
+/** 根据消息类型生成会话预览文本 */
 function buildPreview(type, text) {
   if (type === 'text') {
     return text;
@@ -373,6 +416,7 @@ function buildPreview(type, text) {
   return `${labels[type] || '[消息]'} ${text}`;
 }
 
+/** 根据会话 ID 生成模拟自动回复（不同会话类型有不同的回复风格） */
 function buildAutoReply(conversationId, type) {
   if (conversationId.startsWith('concierge-')) {
     return {
@@ -400,6 +444,7 @@ function buildAutoReply(conversationId, type) {
   };
 }
 
+/** 判断是否为系统类型会话（系统会话不受手机号认证限制） */
 function isSystemConversation(conversation) {
   return (
     conversation.segment === 'system' ||

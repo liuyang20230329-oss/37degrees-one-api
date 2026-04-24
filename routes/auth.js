@@ -1,3 +1,20 @@
+/**
+ * 认证路由模块 (/api/v1/auth)
+ *
+ * 提供完整的用户认证流程：
+ * - POST /sms/send             → 发送短信验证码（本地开发固定为 246810）
+ * - POST /register             → 手机号 + 验证码注册新用户
+ * - POST /login                → 手机号 + 密码登录
+ * - GET  /me                   → 获取当前登录用户信息
+ * - POST /phone/confirm        → 确认手机号验证
+ * - POST /password-reset/request  → 申请重置密码
+ * - POST /password-reset/confirm  → 确认重置密码
+ * - POST /social/:provider     → 第三方登录（微信/QQ，暂未实现）
+ * - POST /social/bind          → 绑定第三方账号
+ * - POST /social/unbind        → 解绑第三方账号
+ * - POST /logout               → 退出登录
+ */
+
 const bcrypt = require('bcryptjs');
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
@@ -13,6 +30,7 @@ const {
 
 const router = express.Router();
 
+/** 发送短信验证码，本地开发环境固定返回 246810 */
 router.post('/sms/send', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -41,6 +59,7 @@ router.post('/sms/send', async (req, res) => {
   });
 });
 
+/** 用户注册：验证短信验证码 → 创建用户 → 初始化隐私设置 → 创建设备会话 → 返回 token */
 router.post('/register', async (req, res) => {
   await db.ready;
   const name = (req.body.name || '').trim();
@@ -61,6 +80,7 @@ router.post('/register', async (req, res) => {
     return;
   }
 
+  /* 校验短信验证码 */
   const latestCode = await db.get(
     `SELECT * FROM sms_codes
      WHERE phone_number = ? AND purpose = 'register'
@@ -76,6 +96,7 @@ router.post('/register', async (req, res) => {
     return;
   }
 
+  /* 检查手机号是否已注册 */
   const existingUser = await db.get(
     'SELECT id FROM users WHERE phone_number = ?',
     [phoneNumber],
@@ -85,6 +106,7 @@ router.post('/register', async (req, res) => {
     return;
   }
 
+  /* 创建用户记录 */
   const now = new Date().toISOString();
   const userId = uuidv4();
   const passwordHash = await bcrypt.hash(password, 10);
@@ -132,6 +154,7 @@ router.post('/register', async (req, res) => {
   });
 });
 
+/** 用户登录：校验密码 → 更新在线状态 → 创建设备会话 → 返回 token */
 router.post('/login', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -164,6 +187,7 @@ router.post('/login', async (req, res) => {
   });
 });
 
+/** 获取当前登录用户信息 */
 router.get('/me', authenticateToken, async (req, res) => {
   await db.ready;
   const user = await loadUserWithWorks(req.auth.userId);
@@ -175,6 +199,7 @@ router.get('/me', authenticateToken, async (req, res) => {
   res.json({ user });
 });
 
+/** 确认手机号验证：校验验证码后更新用户手机号状态 */
 router.post('/phone/confirm', authenticateToken, async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -208,6 +233,7 @@ router.post('/phone/confirm', authenticateToken, async (req, res) => {
   });
 });
 
+/** 申请重置密码：生成验证码并发送 */
 router.post('/password-reset/request', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -235,6 +261,7 @@ router.post('/password-reset/request', async (req, res) => {
   });
 });
 
+/** 确认重置密码：校验验证码后更新密码 */
 router.post('/password-reset/confirm', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -267,12 +294,14 @@ router.post('/password-reset/confirm', async (req, res) => {
   res.json({ success: true });
 });
 
+/** 第三方登录（微信/QQ），当前返回 501 未实现 */
 router.post('/social/:provider(wechat|qq)', async (req, res) => {
   res.status(501).json({
     error: `${req.params.provider === 'wechat' ? '微信' : 'QQ'}登录待配置，请先使用手机号登录。`,
   });
 });
 
+/** 绑定第三方社交账号 */
 router.post('/social/bind', authenticateToken, async (req, res) => {
   await db.ready;
   const provider = req.body.provider;
@@ -287,6 +316,7 @@ router.post('/social/bind', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 解绑第三方社交账号 */
 router.post('/social/unbind', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -296,6 +326,7 @@ router.post('/social/unbind', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 退出登录：将用户标记为离线 */
 router.post('/logout', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -305,6 +336,7 @@ router.post('/logout', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
+/** 根据用户 ID 加载用户信息及其关联的作品列表 */
 async function loadUserWithWorks(userId) {
   const user = await db.get('SELECT * FROM users WHERE id = ?', [userId]);
   if (!user) {
@@ -317,6 +349,7 @@ async function loadUserWithWorks(userId) {
   return formatUserRow(user, works.map(formatWorkRow));
 }
 
+/** 创建设备会话记录，先将该用户的其他会话标记为非当前，再插入新会话 */
 async function createDeviceSession(userId, req) {
   const now = new Date().toISOString();
   await db.run(
@@ -341,6 +374,7 @@ async function createDeviceSession(userId, req) {
   );
 }
 
+/** 根据 User-Agent 推断客户端平台 */
 function inferPlatform(userAgent = '') {
   if (/Android/i.test(userAgent)) {
     return 'android';
@@ -351,10 +385,12 @@ function inferPlatform(userAgent = '') {
   return 'unknown';
 }
 
+/** 将手机号字符串中的非数字字符移除 */
 function normalizePhoneNumber(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+/** 校验是否为以 1 开头的 11 位手机号 */
 function isValidPhone(value) {
   return /^1\d{10}$/.test(value);
 }

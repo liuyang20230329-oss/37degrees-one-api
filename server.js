@@ -1,3 +1,14 @@
+/**
+ * 37° Local API - 主入口文件
+ *
+ * 职责：
+ * 1. 加载环境变量（dotenv）
+ * 2. 初始化 Express 应用及中间件（安全、跨域、日志、JSON 解析）
+ * 3. 注册所有业务路由模块（auth / user / chat / circle / square / notifications / reviews / admin / search / upload）
+ * 4. 提供 /health 健康检查和 /api/v1/status 状态端点
+ * 5. 启动 HTTP 服务并挂载 WebSocket 实时通信服务
+ */
+
 require('dotenv').config();
 
 const cors = require('cors');

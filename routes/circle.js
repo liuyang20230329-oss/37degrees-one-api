@@ -1,3 +1,17 @@
+/**
+ * 圈子动态路由模块 (/api/v1/circle)
+ *
+ * 提供圈子（类似朋友圈/社区动态）的 CRUD 和互动功能：
+ * - GET    /posts                   → 获取已审核通过的动态列表（含多媒体附件）
+ * - GET    /posts/:postId           → 获取单条动态详情（含评论列表）
+ * - POST   /posts                   → 发布新动态（支持图片、语音、动图、链接等附件）
+ * - PUT    /posts/:postId           → 更新动态内容
+ * - POST   /posts/:postId/comments  → 发表评论（支持回复评论）
+ * - POST   /posts/:postId/reports   → 举报动态
+ *
+ * 所有接口均需登录认证
+ */
+
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 
@@ -6,6 +20,7 @@ const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
 
+/** 获取已审核通过的动态列表，每条动态附带多媒体附件 */
 router.get('/posts', authenticateToken, async (req, res) => {
   await db.ready;
   const posts = await db.all(
@@ -24,6 +39,7 @@ router.get('/posts', authenticateToken, async (req, res) => {
   res.json({ posts: mapped });
 });
 
+/** 获取单条动态详情，包含多媒体附件和评论列表 */
 router.get('/posts/:postId', authenticateToken, async (req, res) => {
   await db.ready;
   const post = await db.get('SELECT * FROM circle_posts WHERE id = ?', [req.params.postId]);
@@ -45,6 +61,7 @@ router.get('/posts/:postId', authenticateToken, async (req, res) => {
   });
 });
 
+/** 发布新动态：插入动态主体和多媒体附件，默认审核通过 */
 router.post('/posts', authenticateToken, async (req, res) => {
   await db.ready;
   const currentUser = await db.get('SELECT * FROM users WHERE id = ?', [req.auth.userId]);
@@ -73,6 +90,7 @@ router.post('/posts', authenticateToken, async (req, res) => {
     ],
   );
 
+  /* 处理多媒体附件列表 */
   const attachments = Array.isArray(req.body.attachments) ? req.body.attachments : [];
   let sortOrder = 1;
   for (const attachment of attachments) {
@@ -100,6 +118,7 @@ router.post('/posts', authenticateToken, async (req, res) => {
   });
 });
 
+/** 更新动态内容（仅限本人操作） */
 router.put('/posts/:postId', authenticateToken, async (req, res) => {
   await db.ready;
   const now = new Date().toISOString();
@@ -130,6 +149,7 @@ router.put('/posts/:postId', authenticateToken, async (req, res) => {
   });
 });
 
+/** 发表评论：支持通过 parentCommentId 回复某条评论（楼中楼） */
 router.post('/posts/:postId/comments', authenticateToken, async (req, res) => {
   await db.ready;
   const currentUser = await db.get('SELECT name FROM users WHERE id = ?', [req.auth.userId]);
@@ -160,6 +180,7 @@ router.post('/posts/:postId/comments', authenticateToken, async (req, res) => {
   res.status(201).json({ success: true, commentId });
 });
 
+/** 举报动态 */
 router.post('/posts/:postId/reports', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -171,6 +192,7 @@ router.post('/posts/:postId/reports', authenticateToken, async (req, res) => {
   res.status(201).json({ success: true });
 });
 
+/** 格式化动态数据，附加认证标签和随机距离模拟 */
 function formatPost(post, media) {
   return {
     id: post.id,

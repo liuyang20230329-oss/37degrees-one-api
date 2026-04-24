@@ -1,3 +1,16 @@
+/**
+ * SQLite 数据库配置与初始化模块
+ *
+ * 职责：
+ * 1. 管理 SQLite 数据库文件的路径解析与创建
+ * 2. 提供 Promise 化的数据库操作方法（run / get / all / exec / close）
+ * 3. 定义完整的数据库表结构（schemaSql），涵盖用户、聊天、圈子、广场、通知、管理后台等全部业务表
+ * 4. 在初始化时检测旧版表结构，必要时自动迁移（备份旧库并重建）
+ * 5. 首次启动时自动灌入种子数据（示例用户、轮播公告、系统通知、圈子动态、管理员角色）
+ *
+ * 导出：db 实例（SqliteStore 单例），通过 db.ready (Promise) 等待初始化完成后即可使用
+ */
+
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
@@ -11,6 +24,9 @@ class SqliteStore {
     this.ready = this.initialize();
   }
 
+  /**
+   * 初始化数据库：创建目录 → 打开连接 → 启用外键 → 检测是否需要重置 → 执行建表 → 灌入种子数据
+   */
   async initialize() {
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     await this._open();
@@ -27,6 +43,7 @@ class SqliteStore {
     await this.seed();
   }
 
+  /** 打开 SQLite 数据库连接 */
   async _open() {
     this.db = await new Promise((resolve, reject) => {
       const db = new sqlite3.Database(this.dbPath, (error) => {
@@ -39,6 +56,7 @@ class SqliteStore {
     });
   }
 
+  /** 执行写操作（INSERT / UPDATE / DELETE），返回 { lastID, changes } */
   run(sql, params = []) {
     return new Promise((resolve, reject) => {
       this.db.run(sql, params, function onRun(error) {
@@ -54,6 +72,7 @@ class SqliteStore {
     });
   }
 
+  /** 查询单行记录，无结果时返回 null */
   get(sql, params = []) {
     return new Promise((resolve, reject) => {
       this.db.get(sql, params, (error, row) => {
@@ -66,6 +85,7 @@ class SqliteStore {
     });
   }
 
+  /** 查询多行记录，无结果时返回空数组 */
   all(sql, params = []) {
     return new Promise((resolve, reject) => {
       this.db.all(sql, params, (error, rows) => {
@@ -78,6 +98,7 @@ class SqliteStore {
     });
   }
 
+  /** 执行原始 SQL 语句（常用于建表、PRAGMA 等无返回值的操作） */
   exec(sql) {
     return new Promise((resolve, reject) => {
       this.db.exec(sql, (error) => {
@@ -90,6 +111,7 @@ class SqliteStore {
     });
   }
 
+  /** 关闭数据库连接 */
   async close() {
     if (!this.db) {
       return;
@@ -106,6 +128,10 @@ class SqliteStore {
     this.db = null;
   }
 
+  /**
+   * 检测是否需要重置数据库
+   * 判断条件：users 表存在但缺少 password_hash 或 phone_status 列，说明是旧版表结构
+   */
   async _needsReset() {
     const usersTable = await this.get(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'",
@@ -118,6 +144,10 @@ class SqliteStore {
     return !columnNames.has('password_hash') || !columnNames.has('phone_status');
   }
 
+  /**
+   * 种子数据灌入
+   * 首次启动时创建示例用户、轮播公告、系统通知、圈子动态和管理员角色
+   */
   async seed() {
     const existingBanner = await this.get(
       'SELECT id FROM square_banner_items LIMIT 1',
@@ -127,6 +157,8 @@ class SqliteStore {
     }
 
     const now = new Date().toISOString();
+
+    /* ---- 示例用户（4 个种子账号，统一密码 Password123!） ---- */
     const seedUsers = [
       {
         id: 'seed-user-linwu',
@@ -262,6 +294,7 @@ class SqliteStore {
       );
     }
 
+    /* ---- 广场轮播公告 ---- */
     const banners = [
       ['banner-auth', '37° 广场正在更新可信推荐', '先看推荐卡片，再决定是否继续聊天、语音或见面认识。', 1],
       ['banner-trust', '认证越完整，曝光越稳定', '手机号、实名和本人认证会共同影响推荐顺位与展示权重。', 2],
@@ -274,6 +307,7 @@ class SqliteStore {
       );
     }
 
+    /* ---- 系统通知 ---- */
     const notices = [
       ['notice-1', '平台通知', '今日推荐优先展示资料完整、活跃度高、认证更充分的用户。', 'square', 'high'],
       ['notice-2', '系统提醒', '圈子动态支持文案、定位、图片、语音、动图和网址。', 'circle', 'normal'],
@@ -286,6 +320,7 @@ class SqliteStore {
       );
     }
 
+    /* ---- 圈子示例动态（含多媒体附件） ---- */
     const posts = [
       {
         id: 'circle-1',
@@ -339,6 +374,7 @@ class SqliteStore {
       }
     }
 
+    /* ---- 管理员角色定义 ---- */
     const roles = [
       ['role-super-admin', '超级管理员'],
       ['role-ops-admin', '运营管理员'],
@@ -355,6 +391,11 @@ class SqliteStore {
   }
 }
 
+/**
+ * 解析数据库文件路径
+ * - 未配置或旧路径（data/37degrees.db）时，使用默认路径 data/37degrees-v2.db
+ * - 支持绝对路径和相对路径
+ */
 function resolveDbPath(value) {
   const defaultPath = path.join(__dirname, '..', 'data', '37degrees-v2.db');
   if (!value || value.trim().length === 0) {
@@ -375,6 +416,18 @@ function resolveDbPath(value) {
     : path.resolve(__dirname, '..', value);
 }
 
+/**
+ * 完整的数据库表结构定义
+ *
+ * 包含以下业务域：
+ * - 用户体系：users / sms_codes / user_social_accounts / user_device_sessions / user_works
+ * - 认证审核：identity_verification_requests / face_verification_requests / content_review_records
+ * - 聊天系统：chat_conversations / chat_conversation_members / chat_messages / chat_message_attachments / chat_message_receipts / chat_message_actions / chat_user_privacy_settings / chat_blacklist_entries
+ * - 圈子动态：circle_posts / circle_post_media / circle_comments / circle_reports
+ * - 通知系统：system_notifications / user_notifications
+ * - 广场模块：square_banner_items / saved_square_filters
+ * - 管理后台：admin_roles / admin_permissions / admin_users / admin_audit_logs
+ */
 const schemaSql = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,

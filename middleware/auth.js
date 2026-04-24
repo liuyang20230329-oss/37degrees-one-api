@@ -1,3 +1,12 @@
+/**
+ * 认证中间件 - JWT Token 签发与校验
+ *
+ * 提供两个核心能力：
+ * - signToken(user)：根据用户信息生成 JWT，有效期 7 天
+ * - authenticateToken(req, res, next)：Express 中间件，从 Authorization 头中
+ *   提取 Bearer Token 并验证，验证通过后将解码后的 payload 挂载到 req.auth
+ */
+
 const jwt = require('jsonwebtoken');
 
 const JWT_SECRET = process.env.JWT_SECRET || '37degrees-dev-secret';
