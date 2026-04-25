@@ -1,22 +1,19 @@
 /**
  * 用户路由模块 (/api/v1/users)
  *
- * 提供完整的用户信息管理和个人设置功能：
- * - GET    /me/complete               → 获取当前用户完整信息（含作品列表）
- * - PUT    /me/profile                → 更新用户资料（昵称、头像、性别、生日、城市、签名等）
- * - GET    /me/settings               → 获取隐私和通知设置
- * - PUT    /me/settings               → 更新隐私设置
- * - GET    /me/devices                → 获取登录设备列表
- * - POST   /me/devices/:deviceId/revoke → 注销指定设备会话
- * - GET    /me/blacklist              → 获取黑名单列表
- * - POST   /me/blacklist              → 添加用户到黑名单
- * - DELETE /me/blacklist/:targetUserId → 从黑名单移除用户
- * - POST   /me/works                  → 创建用户作品
- * - DELETE /me/works/:workId          → 删除用户作品
- * - POST   /me/cancel                 → 注销账号（软删除，7天冷却期）
- * - GET    /:userId                   → 查看其他用户公开信息
- *
- * 所有 /me/* 接口均需登录认证，查看他人信息接口无需认证
+ * - GET    /me/complete                  → 完整用户信息
+ * - PUT    /me/profile                   → 更新资料（事务保护）
+ * - GET    /me/settings                  → 隐私和通知设置
+ * - PUT    /me/settings                  → 更新隐私设置
+ * - GET    /me/devices                   → 登录设备列表
+ * - POST   /me/devices/:deviceId/revoke  → 注销设备
+ * - GET    /me/blacklist                 → 黑名单列表
+ * - POST   /me/blacklist                 → 添加黑名单（含重复/自己校验）
+ * - DELETE /me/blacklist/:targetUserId   → 移除黑名单
+ * - POST   /me/works                     → 创建作品
+ * - DELETE /me/works/:workId             → 删除作品
+ * - POST   /me/cancel                    → 注销账号
+ * - GET    /:userId                      → 查看他人信息（排除已注销）
  */
 
 const express = require('express');
@@ -25,14 +22,16 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const {
-  formatUserRow,
   formatWorkRow,
   maskPhoneNumber,
 } = require('../utils/serializers');
+const { loadUserWithWorks } = require('../utils/users');
+
+const VALID_GENDERS = ['male', 'female', 'undisclosed'];
 
 const router = express.Router();
 
-/** 获取当前登录用户的完整信息（包含关联的作品列表） */
+/** 获取当前登录用户的完整信息 */
 router.get('/me/complete', authenticateToken, async (req, res) => {
   await db.ready;
   const user = await loadUserWithWorks(req.auth.userId);
@@ -43,14 +42,7 @@ router.get('/me/complete', authenticateToken, async (req, res) => {
   res.json({ user });
 });
 
-/**
- * 更新用户资料
- * 支持的字段：name / avatarKey / gender / birthYear / birthMonth / city / signature / introVideoTitle / introVideoSummary
- * 特殊逻辑：
- * - 修改头像后自动重置人脸认证状态（需要重新认证）
- * - 性别只能在"未设置"状态下修改一次
- * - 可同步更新作品列表（先删除旧作品再批量插入）
- */
+/** 更新用户资料（事务保护，含输入校验） */
 router.put('/me/profile', authenticateToken, async (req, res) => {
   await db.ready;
   const current = await db.get('SELECT * FROM users WHERE id = ?', [req.auth.userId]);
@@ -59,7 +51,6 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
     return;
   }
 
-  /* 动态构建 UPDATE 语句 */
   const updates = [];
   const values = [];
   const now = new Date().toISOString();
@@ -69,24 +60,41 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
   };
 
   if (typeof req.body.name === 'string' && req.body.name.trim().length > 0) {
-    assign('name', req.body.name.trim());
+    const name = req.body.name.trim();
+    if (name.length > 30) {
+      res.status(400).json({ error: '昵称最多 30 个字符。' });
+      return;
+    }
+    assign('name', name);
   }
-  /* 更换头像后需要重新进行人脸认证 */
   if (typeof req.body.avatarKey === 'string' && req.body.avatarKey.trim()) {
     assign('avatar_key', req.body.avatarKey.trim());
     assign('face_status', 'notStarted');
     assign('face_match_score', null);
     assign('face_verified_at', null);
   }
-  /* 性别仅在未设置时可修改 */
   if (typeof req.body.gender === 'string' && current.gender === 'undisclosed') {
+    if (!VALID_GENDERS.includes(req.body.gender)) {
+      res.status(400).json({ error: '不合法的性别值。' });
+      return;
+    }
     assign('gender', req.body.gender);
   }
   if (req.body.birthYear) {
-    assign('birth_year', Number(req.body.birthYear));
+    const year = Number(req.body.birthYear);
+    if (!Number.isFinite(year) || year < 1900 || year > new Date().getFullYear()) {
+      res.status(400).json({ error: '不合法的出生年份。' });
+      return;
+    }
+    assign('birth_year', year);
   }
   if (req.body.birthMonth) {
-    assign('birth_month', Number(req.body.birthMonth));
+    const month = Number(req.body.birthMonth);
+    if (!Number.isFinite(month) || month < 1 || month > 12) {
+      res.status(400).json({ error: '不合法的出生月份。' });
+      return;
+    }
+    assign('birth_month', month);
   }
   if (typeof req.body.city === 'string') {
     assign('city', req.body.city.trim());
@@ -101,45 +109,46 @@ router.put('/me/profile', authenticateToken, async (req, res) => {
     assign('intro_video_summary', req.body.introVideoSummary.trim());
   }
 
-  if (updates.length > 0) {
-    assign('updated_at', now);
-    values.push(req.auth.userId);
-    await db.run(
-      `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
-      values,
-    );
-  }
-
-  /* 同步更新作品列表（全量替换） */
-  if (Array.isArray(req.body.works)) {
-    await db.run('DELETE FROM user_works WHERE user_id = ?', [req.auth.userId]);
-    for (const work of req.body.works) {
-      await db.run(
-        `INSERT INTO user_works
-         (id, user_id, type, title, summary, media_url, duration, is_pinned, review_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          work.id || uuidv4(),
-          req.auth.userId,
-          work.type || 'image',
-          work.title || '未命名作品',
-          work.summary || '',
-          work.mediaUrl || null,
-          work.duration || null,
-          work.isPinned ? 1 : 0,
-          work.reviewStatus || 'approved',
-          now,
-        ],
+  await db.transaction(async (tx) => {
+    if (updates.length > 0) {
+      assign('updated_at', now);
+      values.push(req.auth.userId);
+      await tx.run(
+        `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+        values,
       );
     }
-  }
+
+    if (Array.isArray(req.body.works)) {
+      await tx.run('DELETE FROM user_works WHERE user_id = ?', [req.auth.userId]);
+      for (const work of req.body.works) {
+        await tx.run(
+          `INSERT INTO user_works
+           (id, user_id, type, title, summary, media_url, duration, is_pinned, review_status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            uuidv4(),
+            req.auth.userId,
+            work.type || 'image',
+            work.title || '未命名作品',
+            work.summary || '',
+            work.mediaUrl || null,
+            work.duration || null,
+            work.isPinned ? 1 : 0,
+            work.reviewStatus || 'approved',
+            now,
+          ],
+        );
+      }
+    }
+  });
 
   res.json({
     user: await loadUserWithWorks(req.auth.userId),
   });
 });
 
-/** 获取当前用户的隐私和通知设置 */
+/** 获取隐私和通知设置 */
 router.get('/me/settings', authenticateToken, async (req, res) => {
   await db.ready;
   const privacy = await db.get(
@@ -164,7 +173,7 @@ router.get('/me/settings', authenticateToken, async (req, res) => {
   });
 });
 
-/** 更新聊天隐私设置（好友可见、广场曝光、优先已认证用户） */
+/** 更新隐私设置 */
 router.put('/me/settings', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -181,19 +190,17 @@ router.put('/me/settings', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/** 获取当前用户的登录设备会话列表 */
+/** 登录设备列表 */
 router.get('/me/devices', authenticateToken, async (req, res) => {
   await db.ready;
   const devices = await db.all(
     'SELECT * FROM user_device_sessions WHERE user_id = ? ORDER BY last_seen_at DESC',
     [req.auth.userId],
   );
-  res.json({
-    devices,
-  });
+  res.json({ devices });
 });
 
-/** 注销指定设备会话（用于踢出其他设备） */
+/** 注销指定设备会话 */
 router.post('/me/devices/:deviceId/revoke', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -203,7 +210,7 @@ router.post('/me/devices/:deviceId/revoke', authenticateToken, async (req, res) 
   res.json({ success: true });
 });
 
-/** 获取当前用户的黑名单列表（包含被拉黑用户的昵称） */
+/** 获取黑名单列表 */
 router.get('/me/blacklist', authenticateToken, async (req, res) => {
   await db.ready;
   const list = await db.all(
@@ -216,21 +223,42 @@ router.get('/me/blacklist', authenticateToken, async (req, res) => {
   res.json({ entries: list });
 });
 
-/** 添加用户到黑名单 */
+/** 添加黑名单（校验目标用户存在性、不能拉黑自己、不能重复） */
 router.post('/me/blacklist', authenticateToken, async (req, res) => {
   await db.ready;
-  if (!req.body.targetUserId) {
+  const targetUserId = req.body.targetUserId;
+  if (!targetUserId) {
     res.status(400).json({ error: '缺少要拉黑的用户。' });
+    return;
+  }
+  if (targetUserId === req.auth.userId) {
+    res.status(400).json({ error: '不能拉黑自己。' });
+    return;
+  }
+  const targetUser = await db.get(
+    'SELECT id FROM users WHERE id = ? AND deleted_at IS NULL',
+    [targetUserId],
+  );
+  if (!targetUser) {
+    res.status(404).json({ error: '未找到该用户。' });
+    return;
+  }
+  const existing = await db.get(
+    'SELECT id FROM chat_blacklist_entries WHERE user_id = ? AND target_user_id = ?',
+    [req.auth.userId, targetUserId],
+  );
+  if (existing) {
+    res.status(400).json({ error: '该用户已在黑名单中。' });
     return;
   }
   await db.run(
     'INSERT INTO chat_blacklist_entries (id, user_id, target_user_id, created_at) VALUES (?, ?, ?, ?)',
-    [uuidv4(), req.auth.userId, req.body.targetUserId, new Date().toISOString()],
+    [uuidv4(), req.auth.userId, targetUserId, new Date().toISOString()],
   );
   res.json({ success: true });
 });
 
-/** 从黑名单移除用户 */
+/** 从黑名单移除 */
 router.delete('/me/blacklist/:targetUserId', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -240,7 +268,7 @@ router.delete('/me/blacklist/:targetUserId', authenticateToken, async (req, res)
   res.json({ success: true });
 });
 
-/** 创建用户作品（图片/视频/语音等） */
+/** 创建用户作品 */
 router.post('/me/works', authenticateToken, async (req, res) => {
   await db.ready;
   const workId = uuidv4();
@@ -276,10 +304,7 @@ router.delete('/me/works/:workId', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/**
- * 注销账号（软删除）
- * 设置 deleted_at 时间戳并标记离线，返回 7 天冷却期结束时间
- */
+/** 注销账号（软删除，7 天冷却期） */
 router.post('/me/cancel', authenticateToken, async (req, res) => {
   await db.ready;
   const now = new Date().toISOString();
@@ -293,16 +318,13 @@ router.post('/me/cancel', authenticateToken, async (req, res) => {
   });
 });
 
-/**
- * 查看其他用户的公开信息
- * 无需认证，返回基本资料和作品列表
- */
+/** 查看其他用户公开信息（排除已注销用户） */
 router.get('/:userId', async (req, res) => {
   await db.ready;
   const user = await db.get(
     `SELECT id, name, avatar_key, gender, birth_year, birth_month, city, signature,
             intro_video_title, intro_video_summary, membership_level, is_online, activity_score
-     FROM users WHERE id = ?`,
+     FROM users WHERE id = ? AND deleted_at IS NULL`,
     [req.params.userId],
   );
   if (!user) {
@@ -333,21 +355,5 @@ router.get('/:userId', async (req, res) => {
     },
   });
 });
-
-/** 加载用户信息及其关联的作品列表，自动补充脱敏手机号 */
-async function loadUserWithWorks(userId) {
-  const row = await db.get('SELECT * FROM users WHERE id = ?', [userId]);
-  if (!row) {
-    return null;
-  }
-  const works = await db.all(
-    'SELECT * FROM user_works WHERE user_id = ? ORDER BY is_pinned DESC, created_at DESC',
-    [userId],
-  );
-  if (!row.masked_phone_number && row.phone_number) {
-    row.masked_phone_number = maskPhoneNumber(row.phone_number);
-  }
-  return formatUserRow(row, works.map(formatWorkRow));
-}
 
 module.exports = router;

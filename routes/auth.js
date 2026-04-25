@@ -2,17 +2,17 @@
  * 认证路由模块 (/api/v1/auth)
  *
  * 提供完整的用户认证流程：
- * - POST /sms/send             → 发送短信验证码（本地开发固定为 246810）
- * - POST /register             → 手机号 + 验证码注册新用户
- * - POST /login                → 手机号 + 密码登录
- * - GET  /me                   → 获取当前登录用户信息
- * - POST /phone/confirm        → 确认手机号验证
+ * - POST /sms/send                → 发送短信验证码
+ * - POST /register                → 手机号 + 验证码注册新用户（事务）
+ * - POST /login                   → 手机号 + 密码登录
+ * - GET  /me                      → 获取当前登录用户信息
+ * - POST /phone/confirm           → 确认手机号验证
  * - POST /password-reset/request  → 申请重置密码
- * - POST /password-reset/confirm  → 确认重置密码
- * - POST /social/:provider     → 第三方登录（微信/QQ，暂未实现）
- * - POST /social/bind          → 绑定第三方账号
- * - POST /social/unbind        → 解绑第三方账号
- * - POST /logout               → 退出登录
+ * - POST /password-reset/confirm  → 确认重置密码（含过期校验）
+ * - POST /social/:provider        → 第三方登录（微信/QQ，暂未实现）
+ * - POST /social/bind             → 绑定第三方账号
+ * - POST /social/unbind           → 解绑第三方账号
+ * - POST /logout                  → 退出登录
  */
 
 const bcrypt = require('bcryptjs');
@@ -27,10 +27,15 @@ const {
   maskIdNumber,
   maskPhoneNumber,
 } = require('../utils/serializers');
+const { loadUserWithWorks } = require('../utils/users');
+
+const VALID_MESSAGE_TYPES = ['text', 'image', 'voice', 'video', 'emoji', 'location', 'forwarded', 'system'];
+const VALID_PROVIDERS = ['wechat', 'qq'];
+const VALID_GENDERS = ['male', 'female', 'undisclosed'];
 
 const router = express.Router();
 
-/** 发送短信验证码，本地开发环境固定返回 246810 */
+/** 发送短信验证码 */
 router.post('/sms/send', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -54,12 +59,11 @@ router.post('/sms/send', async (req, res) => {
   res.json({
     sessionId,
     phoneNumber,
-    debugCode: code,
     expiresAt,
   });
 });
 
-/** 用户注册：验证短信验证码 → 创建用户 → 初始化隐私设置 → 创建设备会话 → 返回 token */
+/** 用户注册（事务保护） */
 router.post('/register', async (req, res) => {
   await db.ready;
   const name = (req.body.name || '').trim();
@@ -71,6 +75,10 @@ router.post('/register', async (req, res) => {
     res.status(400).json({ error: '昵称至少需要 2 个字符。' });
     return;
   }
+  if (name.length > 30) {
+    res.status(400).json({ error: '昵称最多 30 个字符。' });
+    return;
+  }
   if (!isValidPhone(phoneNumber)) {
     res.status(400).json({ error: '请输入有效的 11 位手机号。' });
     return;
@@ -79,8 +87,11 @@ router.post('/register', async (req, res) => {
     res.status(400).json({ error: '密码至少需要 8 位。' });
     return;
   }
+  if (password.length > 128) {
+    res.status(400).json({ error: '密码最多 128 位。' });
+    return;
+  }
 
-  /* 校验短信验证码 */
   const latestCode = await db.get(
     `SELECT * FROM sms_codes
      WHERE phone_number = ? AND purpose = 'register'
@@ -95,8 +106,11 @@ router.post('/register', async (req, res) => {
     res.status(400).json({ error: '注册验证码已过期。' });
     return;
   }
+  if (latestCode.consumed_at) {
+    res.status(400).json({ error: '注册验证码已被使用。' });
+    return;
+  }
 
-  /* 检查手机号是否已注册 */
   const existingUser = await db.get(
     'SELECT id FROM users WHERE phone_number = ?',
     [phoneNumber],
@@ -106,43 +120,45 @@ router.post('/register', async (req, res) => {
     return;
   }
 
-  /* 创建用户记录 */
   const now = new Date().toISOString();
   const userId = uuidv4();
   const passwordHash = await bcrypt.hash(password, 10);
-  await db.run(
-    `INSERT INTO users (
-      id, name, email, phone_number, password_hash, avatar_key, gender,
-      city, signature, intro_video_title, intro_video_summary, phone_status,
-      masked_phone_number, phone_verified_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      userId,
-      name,
-      `${phoneNumber}@37degrees.local`,
-      phoneNumber,
-      passwordHash,
-      'aurora',
-      'undisclosed',
-      '未设置地区',
-      '这个人很酷，还没有留下签名。',
-      '还没有上传视频介绍',
-      '后续可以用一段视频介绍自己，让更多人更快认识你。',
-      'verified',
-      maskPhoneNumber(phoneNumber),
-      now,
-      now,
-      now,
-    ],
-  );
-  await db.run(
-    'INSERT OR REPLACE INTO chat_user_privacy_settings (user_id, friends_only, allow_square_exposure, prefer_verified_users) VALUES (?, ?, ?, ?)',
-    [userId, 0, 1, 1],
-  );
-  await db.run(
-    'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
-    [now, latestCode.id],
-  );
+
+  await db.transaction(async (tx) => {
+    await tx.run(
+      `INSERT INTO users (
+        id, name, email, phone_number, password_hash, avatar_key, gender,
+        city, signature, intro_video_title, intro_video_summary, phone_status,
+        masked_phone_number, phone_verified_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        name,
+        `${phoneNumber}@37degrees.local`,
+        phoneNumber,
+        passwordHash,
+        'aurora',
+        'undisclosed',
+        '未设置地区',
+        '这个人很酷，还没有留下签名。',
+        '还没有上传视频介绍',
+        '后续可以用一段视频介绍自己，让更多人更快认识你。',
+        'verified',
+        maskPhoneNumber(phoneNumber),
+        now,
+        now,
+        now,
+      ],
+    );
+    await tx.run(
+      'INSERT OR REPLACE INTO chat_user_privacy_settings (user_id, friends_only, allow_square_exposure, prefer_verified_users) VALUES (?, ?, ?, ?)',
+      [userId, 0, 1, 1],
+    );
+    await tx.run(
+      'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
+      [now, latestCode.id],
+    );
+  });
 
   const user = await loadUserWithWorks(userId);
   const token = signToken(user);
@@ -154,7 +170,7 @@ router.post('/register', async (req, res) => {
   });
 });
 
-/** 用户登录：校验密码 → 更新在线状态 → 创建设备会话 → 返回 token */
+/** 用户登录 */
 router.post('/login', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -199,7 +215,7 @@ router.get('/me', authenticateToken, async (req, res) => {
   res.json({ user });
 });
 
-/** 确认手机号验证：校验验证码后更新用户手机号状态 */
+/** 确认手机号验证（事务保护） */
 router.post('/phone/confirm', authenticateToken, async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -215,25 +231,32 @@ router.post('/phone/confirm', authenticateToken, async (req, res) => {
     res.status(400).json({ error: '验证码不正确。' });
     return;
   }
+  if (new Date(latestCode.expires_at).getTime() < Date.now()) {
+    res.status(400).json({ error: '验证码已过期。' });
+    return;
+  }
   const now = new Date().toISOString();
-  await db.run(
-    `UPDATE users
-     SET phone_number = ?, masked_phone_number = ?, phone_status = 'verified',
-         phone_verified_at = ?, updated_at = ?
-     WHERE id = ?`,
-    [phoneNumber, maskPhoneNumber(phoneNumber), now, now, req.auth.userId],
-  );
-  await db.run(
-    'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
-    [now, latestCode.id],
-  );
+
+  await db.transaction(async (tx) => {
+    await tx.run(
+      `UPDATE users
+       SET phone_number = ?, masked_phone_number = ?, phone_status = 'verified',
+           phone_verified_at = ?, updated_at = ?
+       WHERE id = ?`,
+      [phoneNumber, maskPhoneNumber(phoneNumber), now, now, req.auth.userId],
+    );
+    await tx.run(
+      'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
+      [now, latestCode.id],
+    );
+  });
 
   res.json({
     user: await loadUserWithWorks(req.auth.userId),
   });
 });
 
-/** 申请重置密码：生成验证码并发送 */
+/** 申请重置密码 */
 router.post('/password-reset/request', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -256,12 +279,11 @@ router.post('/password-reset/request', async (req, res) => {
 
   res.json({
     sessionId,
-    debugCode: code,
     expiresAt,
   });
 });
 
-/** 确认重置密码：校验验证码后更新密码 */
+/** 确认重置密码（含过期和使用校验） */
 router.post('/password-reset/confirm', async (req, res) => {
   await db.ready;
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
@@ -269,6 +291,10 @@ router.post('/password-reset/confirm', async (req, res) => {
   const newPassword = req.body.newPassword || '';
   if (newPassword.length < 8) {
     res.status(400).json({ error: '新密码至少需要 8 位。' });
+    return;
+  }
+  if (newPassword.length > 128) {
+    res.status(400).json({ error: '新密码最多 128 位。' });
     return;
   }
 
@@ -282,15 +308,27 @@ router.post('/password-reset/confirm', async (req, res) => {
     res.status(400).json({ error: '验证码不正确。' });
     return;
   }
+  if (new Date(latestCode.expires_at).getTime() < Date.now()) {
+    res.status(400).json({ error: '验证码已过期。' });
+    return;
+  }
+  if (latestCode.consumed_at) {
+    res.status(400).json({ error: '验证码已被使用。' });
+    return;
+  }
 
-  await db.run(
-    'UPDATE users SET password_hash = ?, updated_at = ? WHERE phone_number = ?',
-    [await bcrypt.hash(newPassword, 10), new Date().toISOString(), phoneNumber],
-  );
-  await db.run(
-    'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
-    [new Date().toISOString(), latestCode.id],
-  );
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx.run(
+      'UPDATE users SET password_hash = ?, updated_at = ? WHERE phone_number = ?',
+      [await bcrypt.hash(newPassword, 10), now, phoneNumber],
+    );
+    await tx.run(
+      'UPDATE sms_codes SET consumed_at = ? WHERE id = ?',
+      [now, latestCode.id],
+    );
+  });
+
   res.json({ success: true });
 });
 
@@ -301,12 +339,12 @@ router.post('/social/:provider(wechat|qq)', async (req, res) => {
   });
 });
 
-/** 绑定第三方社交账号 */
+/** 绑定第三方社交账号（校验 provider 合法性） */
 router.post('/social/bind', authenticateToken, async (req, res) => {
   await db.ready;
   const provider = req.body.provider;
-  if (!provider) {
-    res.status(400).json({ error: '缺少第三方平台标识。' });
+  if (!provider || !VALID_PROVIDERS.includes(provider)) {
+    res.status(400).json({ error: '不支持的平台类型。' });
     return;
   }
   await db.run(
@@ -319,6 +357,10 @@ router.post('/social/bind', authenticateToken, async (req, res) => {
 /** 解绑第三方社交账号 */
 router.post('/social/unbind', authenticateToken, async (req, res) => {
   await db.ready;
+  if (!req.body.provider || !VALID_PROVIDERS.includes(req.body.provider)) {
+    res.status(400).json({ error: '不支持的平台类型。' });
+    return;
+  }
   await db.run(
     'DELETE FROM user_social_accounts WHERE user_id = ? AND provider = ?',
     [req.auth.userId, req.body.provider],
@@ -326,7 +368,7 @@ router.post('/social/unbind', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/** 退出登录：将用户标记为离线 */
+/** 退出登录 */
 router.post('/logout', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -336,20 +378,7 @@ router.post('/logout', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/** 根据用户 ID 加载用户信息及其关联的作品列表 */
-async function loadUserWithWorks(userId) {
-  const user = await db.get('SELECT * FROM users WHERE id = ?', [userId]);
-  if (!user) {
-    return null;
-  }
-  const works = await db.all(
-    'SELECT * FROM user_works WHERE user_id = ? ORDER BY is_pinned DESC, created_at DESC',
-    [userId],
-  );
-  return formatUserRow(user, works.map(formatWorkRow));
-}
-
-/** 创建设备会话记录，先将该用户的其他会话标记为非当前，再插入新会话 */
+/** 创建设备会话记录 */
 async function createDeviceSession(userId, req) {
   const now = new Date().toISOString();
   await db.run(
@@ -376,8 +405,17 @@ async function createDeviceSession(userId, req) {
 
 /** 根据 User-Agent 推断客户端平台 */
 function inferPlatform(userAgent = '') {
+  if (/iPhone|iPad|iPod/i.test(userAgent)) {
+    return 'ios';
+  }
   if (/Android/i.test(userAgent)) {
     return 'android';
+  }
+  if (/Macintosh/i.test(userAgent)) {
+    return 'macos';
+  }
+  if (/Linux/i.test(userAgent)) {
+    return 'linux';
   }
   if (/Windows/i.test(userAgent)) {
     return 'windows';
@@ -385,12 +423,10 @@ function inferPlatform(userAgent = '') {
   return 'unknown';
 }
 
-/** 将手机号字符串中的非数字字符移除 */
 function normalizePhoneNumber(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
-/** 校验是否为以 1 开头的 11 位手机号 */
 function isValidPhone(value) {
   return /^1\d{10}$/.test(value);
 }

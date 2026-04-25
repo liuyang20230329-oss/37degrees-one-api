@@ -1,19 +1,16 @@
 /**
  * 聊天路由模块 (/api/v1/chat)
  *
- * 提供完整的聊天会话和消息管理功能：
- * - GET    /conversations                        → 获取当前用户的会话列表
- * - POST   /conversations                        → 创建新会话
- * - PATCH  /conversations/:conversationId/pin    → 切换会话置顶状态
- * - POST   /conversations/read-all               → 全部标记已读
- * - POST   /conversations/:conversationId/read   → 标记单个会话已读
+ * - GET    /conversations                        → 获取会话列表
+ * - POST   /conversations                        → 创建新会话（事务）
+ * - PATCH  /conversations/:conversationId/pin    → 切换置顶
+ * - POST   /conversations/read-all               → 全部已读
+ * - POST   /conversations/:conversationId/read   → 单个已读
  * - DELETE /conversations/:conversationId         → 删除会话
- * - GET    /messages/:conversationId             → 获取会话消息列表
- * - POST   /messages                             → 发送消息（支持多种类型，自动生成模拟回复）
- * - GET    /privacy                              → 获取聊天隐私设置
- * - PUT    /privacy                              → 更新聊天隐私设置
- *
- * 所有接口均需登录认证
+ * - GET    /messages/:conversationId             → 消息列表（分页）
+ * - POST   /messages                             → 发送消息（事务，含自动回复）
+ * - GET    /privacy                              → 隐私设置
+ * - PUT    /privacy                              → 更新隐私设置
  */
 
 const express = require('express');
@@ -27,9 +24,14 @@ const {
   formatMessageRow,
 } = require('../utils/serializers');
 
+const VALID_MESSAGE_TYPES = ['text', 'image', 'voice', 'video', 'emoji', 'location', 'forwarded', 'system'];
+const MAX_MESSAGE_LENGTH = 5000;
+const MAX_TITLE_LENGTH = 50;
+const DEFAULT_PAGE_SIZE = 20;
+
 const router = express.Router();
 
-/** 获取当前用户的会话列表，首次访问时自动创建种子会话 */
+/** 获取当前用户的会话列表 */
 router.get('/conversations', authenticateToken, async (req, res) => {
   await db.ready;
   await ensureSeedConversations(req.auth.userId);
@@ -44,40 +46,48 @@ router.get('/conversations', authenticateToken, async (req, res) => {
   });
 });
 
-/** 创建新会话：插入会话记录、创建者成员、系统初始消息，并通过 WebSocket 通知客户端 */
+/** 创建新会话（事务保护） */
 router.post('/conversations', authenticateToken, async (req, res) => {
   await db.ready;
+  const title = req.body.title || '新会话';
+  if (title.length > MAX_TITLE_LENGTH) {
+    res.status(400).json({ error: `会话标题不能超过 ${MAX_TITLE_LENGTH} 个字符。` });
+    return;
+  }
   const now = new Date().toISOString();
   const id = uuidv4();
-  await db.run(
-    `INSERT INTO chat_conversations
-     (id, user_id, title, subtitle, category_label, segment, last_message_preview, unread_count, is_pinned, is_online, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      req.auth.userId,
-      req.body.title || '新会话',
-      req.body.subtitle || '刚刚创建',
-      req.body.categoryLabel || '私聊',
-      req.body.segment || 'friends',
-      '新的会话已经创建，可以开始聊天了。',
-      1,
-      0,
-      1,
-      now,
-      now,
-    ],
-  );
-  await db.run(
-    'INSERT INTO chat_conversation_members (id, conversation_id, member_user_id, role) VALUES (?, ?, ?, ?)',
-    [uuidv4(), id, req.auth.userId, 'owner'],
-  );
-  await db.run(
-    `INSERT INTO chat_messages
-     (id, conversation_id, sender_id, sender_name, text, type, delivery_status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [uuidv4(), id, 'system', '37°', '新的会话已经创建，可以开始聊天了。', 'system', 'Delivered', now],
-  );
+
+  await db.transaction(async (tx) => {
+    await tx.run(
+      `INSERT INTO chat_conversations
+       (id, user_id, title, subtitle, category_label, segment, last_message_preview, unread_count, is_pinned, is_online, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        req.auth.userId,
+        title,
+        req.body.subtitle || '刚刚创建',
+        req.body.categoryLabel || '私聊',
+        req.body.segment || 'friends',
+        '新的会话已经创建，可以开始聊天了。',
+        1,
+        0,
+        1,
+        now,
+        now,
+      ],
+    );
+    await tx.run(
+      'INSERT INTO chat_conversation_members (id, conversation_id, member_user_id, role) VALUES (?, ?, ?, ?)',
+      [uuidv4(), id, req.auth.userId, 'owner'],
+    );
+    await tx.run(
+      `INSERT INTO chat_messages
+       (id, conversation_id, sender_id, sender_name, text, type, delivery_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [uuidv4(), id, 'system', '37°', '新的会话已经创建，可以开始聊天了。', 'system', 'Delivered', now],
+    );
+  });
 
   const conversation = await db.get(
     'SELECT * FROM chat_conversations WHERE id = ?',
@@ -92,7 +102,7 @@ router.post('/conversations', authenticateToken, async (req, res) => {
   });
 });
 
-/** 切换会话的置顶/取消置顶状态 */
+/** 切换会话置顶状态 */
 router.patch('/conversations/:conversationId/pin', authenticateToken, async (req, res) => {
   await db.ready;
   const current = await db.get(
@@ -114,7 +124,7 @@ router.patch('/conversations/:conversationId/pin', authenticateToken, async (req
   res.json({ success: true });
 });
 
-/** 将当前用户所有会话标记为已读 */
+/** 全部会话标记已读 */
 router.post('/conversations/read-all', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -125,7 +135,7 @@ router.post('/conversations/read-all', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/** 将指定会话标记为已读 */
+/** 标记单个会话已读 */
 router.post('/conversations/:conversationId/read', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -139,9 +149,17 @@ router.post('/conversations/:conversationId/read', authenticateToken, async (req
   res.json({ success: true });
 });
 
-/** 删除指定会话（级联删除关联的消息和成员记录） */
+/** 删除会话（校验存在性） */
 router.delete('/conversations/:conversationId', authenticateToken, async (req, res) => {
   await db.ready;
+  const existing = await db.get(
+    'SELECT id FROM chat_conversations WHERE id = ? AND user_id = ?',
+    [req.params.conversationId, req.auth.userId],
+  );
+  if (!existing) {
+    res.status(404).json({ error: '未找到该会话。' });
+    return;
+  }
   await db.run(
     'DELETE FROM chat_conversations WHERE id = ? AND user_id = ?',
     [req.params.conversationId, req.auth.userId],
@@ -153,7 +171,7 @@ router.delete('/conversations/:conversationId', authenticateToken, async (req, r
   res.json({ success: true });
 });
 
-/** 获取指定会话的全部消息记录 */
+/** 获取会话消息列表（分页） */
 router.get('/messages/:conversationId', authenticateToken, async (req, res) => {
   await db.ready;
   const conversation = await db.get(
@@ -165,25 +183,32 @@ router.get('/messages/:conversationId', authenticateToken, async (req, res) => {
     return;
   }
 
-  const messages = await db.all(
-    `SELECT * FROM chat_messages
-     WHERE conversation_id = ?
-     ORDER BY created_at ASC`,
-    [req.params.conversationId],
-  );
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || DEFAULT_PAGE_SIZE));
+  const offset = (page - 1) * pageSize;
+
+  const [messages, total] = await Promise.all([
+    db.all(
+      `SELECT * FROM chat_messages
+       WHERE conversation_id = ?
+       ORDER BY created_at ASC
+       LIMIT ? OFFSET ?`,
+      [req.params.conversationId, pageSize, offset],
+    ),
+    db.get(
+      'SELECT COUNT(*) AS count FROM chat_messages WHERE conversation_id = ?',
+      [req.params.conversationId],
+    ),
+  ]);
   res.json({
     messages: messages.map(formatMessageRow),
+    total: total.count,
+    page,
+    pageSize,
   });
 });
 
-/**
- * 发送消息：
- * 1. 校验会话和用户状态
- * 2. 非系统会话需要完成手机号认证才能发私聊
- * 3. 插入消息记录并更新会话预览
- * 4. 根据会话类型生成模拟自动回复
- * 5. 通过 WebSocket 推送实时通知
- */
+/** 发送消息（事务保护，校验消息类型和长度） */
 router.post('/messages', authenticateToken, async (req, res) => {
   await db.ready;
   const conversationId = req.body.conversationId;
@@ -191,6 +216,19 @@ router.post('/messages', authenticateToken, async (req, res) => {
   const type = req.body.type || 'text';
   const mediaUrl = req.body.mediaUrl || null;
   const metadataLabel = req.body.metadataLabel || null;
+
+  if (!VALID_MESSAGE_TYPES.includes(type)) {
+    res.status(400).json({ error: '不合法的消息类型。' });
+    return;
+  }
+  if (text.length === 0) {
+    res.status(400).json({ error: '消息内容不能为空。' });
+    return;
+  }
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    res.status(400).json({ error: `消息不能超过 ${MAX_MESSAGE_LENGTH} 个字符。` });
+    return;
+  }
 
   const conversation = await db.get(
     'SELECT * FROM chat_conversations WHERE id = ? AND user_id = ?',
@@ -213,60 +251,57 @@ router.post('/messages', authenticateToken, async (req, res) => {
     res.status(403).json({ error: '请先完成手机号认证后再发起私聊。' });
     return;
   }
-  if (text.length === 0) {
-    res.status(400).json({ error: '消息内容不能为空。' });
-    return;
-  }
 
-  /* 插入用户发送的消息 */
   const now = new Date();
   const messageId = uuidv4();
-  await db.run(
-    `INSERT INTO chat_messages
-     (id, conversation_id, sender_id, sender_name, text, type, delivery_status, media_url, metadata_label, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      messageId,
-      conversationId,
-      req.auth.userId,
-      currentUser.name,
-      text,
-      type,
-      'Delivered',
-      mediaUrl,
-      metadataLabel,
-      now.toISOString(),
-    ],
-  );
-  await db.run(
-    'UPDATE chat_conversations SET last_message_preview = ?, unread_count = 0, updated_at = ? WHERE id = ?',
-    [buildPreview(type, text), now.toISOString(), conversationId],
-  );
-
-  /* 生成模拟自动回复 */
   const reply = buildAutoReply(conversationId, type);
-  if (reply) {
-    const replyTime = new Date(now.getTime() + 1000).toISOString();
-    await db.run(
+
+  await db.transaction(async (tx) => {
+    await tx.run(
       `INSERT INTO chat_messages
-       (id, conversation_id, sender_id, sender_name, text, type, delivery_status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, sender_id, sender_name, text, type, delivery_status, media_url, metadata_label, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        uuidv4(),
+        messageId,
         conversationId,
-        reply.senderId,
-        reply.senderName,
-        reply.text,
-        reply.type,
-        'Read',
-        replyTime,
+        req.auth.userId,
+        currentUser.name,
+        text,
+        type,
+        'Delivered',
+        mediaUrl,
+        metadataLabel,
+        now.toISOString(),
       ],
     );
-    await db.run(
-      'UPDATE chat_conversations SET last_message_preview = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?',
-      [buildPreview(reply.type, reply.text), replyTime, conversationId],
+    await tx.run(
+      'UPDATE chat_conversations SET last_message_preview = ?, unread_count = 0, updated_at = ? WHERE id = ?',
+      [buildPreview(type, text), now.toISOString(), conversationId],
     );
-  }
+
+    if (reply) {
+      const replyTime = new Date(now.getTime() + 1000).toISOString();
+      await tx.run(
+        `INSERT INTO chat_messages
+         (id, conversation_id, sender_id, sender_name, text, type, delivery_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uuidv4(),
+          conversationId,
+          reply.senderId,
+          reply.senderName,
+          reply.text,
+          reply.type,
+          'Read',
+          replyTime,
+        ],
+      );
+      await tx.run(
+        'UPDATE chat_conversations SET last_message_preview = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?',
+        [buildPreview(reply.type, reply.text), replyTime, conversationId],
+      );
+    }
+  });
 
   realtime.pushToUser(req.auth.userId, {
     kind: 'message-created',
@@ -282,7 +317,7 @@ router.post('/messages', authenticateToken, async (req, res) => {
   });
 });
 
-/** 获取当前用户的聊天隐私设置 */
+/** 获取聊天隐私设置 */
 router.get('/privacy', authenticateToken, async (req, res) => {
   await db.ready;
   const settings = await db.get(
@@ -298,7 +333,7 @@ router.get('/privacy', authenticateToken, async (req, res) => {
   });
 });
 
-/** 更新聊天隐私设置（好友可见、广场曝光、优先已认证用户） */
+/** 更新聊天隐私设置 */
 router.put('/privacy', authenticateToken, async (req, res) => {
   await db.ready;
   await db.run(
@@ -315,10 +350,6 @@ router.put('/privacy', authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-/**
- * 确保新用户拥有初始种子会话
- * 首次访问会话列表时，自动创建 5 个预设会话（向导、私聊、热聊群、关注者、关注中）
- */
 async function ensureSeedConversations(userId) {
   const exists = await db.get(
     'SELECT id FROM chat_conversations WHERE user_id = ? LIMIT 1',
@@ -383,7 +414,6 @@ async function ensureSeedConversations(userId) {
   }
 }
 
-/** 根据种子会话类型返回预设的初始消息文本 */
 function seedPreview(seedKey) {
   switch (seedKey) {
     case 'concierge':
@@ -399,7 +429,6 @@ function seedPreview(seedKey) {
   }
 }
 
-/** 根据消息类型生成会话预览文本 */
 function buildPreview(type, text) {
   if (type === 'text') {
     return text;
@@ -416,7 +445,6 @@ function buildPreview(type, text) {
   return `${labels[type] || '[消息]'} ${text}`;
 }
 
-/** 根据会话 ID 生成模拟自动回复（不同会话类型有不同的回复风格） */
 function buildAutoReply(conversationId, type) {
   if (conversationId.startsWith('concierge-')) {
     return {
@@ -444,7 +472,6 @@ function buildAutoReply(conversationId, type) {
   };
 }
 
-/** 判断是否为系统类型会话（系统会话不受手机号认证限制） */
 function isSystemConversation(conversation) {
   return (
     conversation.segment === 'system' ||

@@ -1,19 +1,11 @@
 /**
  * 广场路由模块 (/api/v1/square)
  *
- * 提供广场（推荐发现页）的浏览和筛选功能：
- * - GET  /banner   → 获取广场轮播公告列表
- * - GET  /notices  → 获取系统公告通知
- * - GET  /users    → 获取推荐用户列表（支持多维度筛选）
+ * - GET  /banner   → 轮播公告
+ * - GET  /notices  → 系统公告
+ * - GET  /users    → 推荐用户列表（分页）
  * - POST /filters  → 保存筛选条件
- * - GET  /filters  → 获取已保存的筛选条件
- *
- * 推荐用户排序逻辑：
- * 1. 人脸已认证 > 实名已认证 > 未认证
- * 2. 在线优先
- * 3. 活跃度降序
- *
- * 所有接口均需登录认证
+ * - GET  /filters  → 已保存的筛选条件
  */
 
 const express = require('express');
@@ -22,9 +14,10 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
+const DEFAULT_PAGE_SIZE = 20;
+
 const router = express.Router();
 
-/** 获取广场轮播公告（仅活跃状态） */
 router.get('/banner', authenticateToken, async (req, res) => {
   await db.ready;
   const items = await db.all(
@@ -36,7 +29,6 @@ router.get('/banner', authenticateToken, async (req, res) => {
   res.json({ items });
 });
 
-/** 获取系统公告通知（最近 10 条） */
 router.get('/notices', authenticateToken, async (req, res) => {
   await db.ready;
   const notices = await db.all(
@@ -45,18 +37,16 @@ router.get('/notices', authenticateToken, async (req, res) => {
   res.json({ notices });
 });
 
-/**
- * 获取推荐用户列表
- * 支持的筛选参数：region（地区）、gender（性别）、membershipLevel（会员等级）、
- *               verifiedOnly（仅已认证）、onlineOnly（仅在线）、search（关键词搜索）
- * 排序：认证状态 > 在线状态 > 活跃度
- */
+/** 推荐用户列表（分页，支持多维筛选） */
 router.get('/users', authenticateToken, async (req, res) => {
   await db.ready;
-  const where = ['id != ?'];
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || DEFAULT_PAGE_SIZE));
+  const offset = (page - 1) * pageSize;
+
+  const where = ['id != ?', 'deleted_at IS NULL'];
   const params = [req.auth.userId];
 
-  /* 动态拼接筛选条件 */
   if (req.query.region) {
     where.push('city = ?');
     params.push(req.query.region);
@@ -80,25 +70,31 @@ router.get('/users', authenticateToken, async (req, res) => {
     params.push(`%${req.query.search}%`, `%${req.query.search}%`);
   }
 
-  const users = await db.all(
-    `SELECT *
-     FROM users
-     WHERE ${where.join(' AND ')}
-     ORDER BY
-       CASE WHEN face_status = 'verified' THEN 2 WHEN identity_status = 'verified' THEN 1 ELSE 0 END DESC,
-       is_online DESC,
-       activity_score DESC`,
-    params,
-  );
+  const [users, total] = await Promise.all([
+    db.all(
+      `SELECT *
+       FROM users
+       WHERE ${where.join(' AND ')}
+       ORDER BY
+         CASE WHEN face_status = 'verified' THEN 2 WHEN identity_status = 'verified' THEN 1 ELSE 0 END DESC,
+         is_online DESC,
+         activity_score DESC
+       LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset],
+    ),
+    db.get(
+      `SELECT COUNT(*) AS count FROM users WHERE ${where.join(' AND ')}`,
+      params,
+    ),
+  ]);
 
-  /* 格式化输出，附加计算字段（年龄、距离、标签、信任等级） */
   const mapped = users.map((row, index) => ({
     id: row.id,
     name: row.name,
     gender: row.gender,
     age: calculateAge(row.birth_year, row.birth_month),
     city: row.city,
-    distance: `${(index + 1) * 1.2}km`,
+    distance: `${(offset + index + 1) * 1.2}km`,
     signature: row.signature,
     tags: buildTags(row),
     trustLabel: row.face_status === 'verified'
@@ -111,10 +107,9 @@ router.get('/users', authenticateToken, async (req, res) => {
     membershipLevel: row.membership_level,
   }));
 
-  res.json({ users: mapped });
+  res.json({ users: mapped, total: total.count, page, pageSize });
 });
 
-/** 保存筛选条件（用户可自定义筛选组合） */
 router.post('/filters', authenticateToken, async (req, res) => {
   await db.ready;
   const id = uuidv4();
@@ -138,7 +133,6 @@ router.post('/filters', authenticateToken, async (req, res) => {
   res.status(201).json({ success: true, filterId: id });
 });
 
-/** 获取当前用户已保存的筛选条件列表 */
 router.get('/filters', authenticateToken, async (req, res) => {
   await db.ready;
   const filters = await db.all(
@@ -148,7 +142,6 @@ router.get('/filters', authenticateToken, async (req, res) => {
   res.json({ filters });
 });
 
-/** 根据出生年月计算年龄 */
 function calculateAge(year, month) {
   if (!year || !month) {
     return null;
@@ -161,7 +154,6 @@ function calculateAge(year, month) {
   return age;
 }
 
-/** 根据用户状态构建标签数组（真人、高热度、在线、偏好） */
 function buildTags(row) {
   const tags = [];
   if (row.face_status === 'verified') {

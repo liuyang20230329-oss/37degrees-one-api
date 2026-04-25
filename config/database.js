@@ -111,6 +111,22 @@ class SqliteStore {
     });
   }
 
+  /**
+   * 执行事务：接收一个 async callback，在 BEGIN … COMMIT 之间执行
+   * 如果 callback 抛出异常则自动 ROLLBACK
+   */
+  async transaction(fn) {
+    await this.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await fn(this);
+      await this.exec('COMMIT');
+      return result;
+    } catch (error) {
+      await this.exec('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  }
+
   /** 关闭数据库连接 */
   async close() {
     if (!this.db) {
@@ -750,6 +766,15 @@ CREATE INDEX IF NOT EXISTS idx_chat_conversations_user ON chat_conversations(use
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_circle_posts_user ON circle_posts(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_notifications_user ON user_notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_sms_codes_phone ON sms_codes(phone_number, purpose);
+CREATE INDEX IF NOT EXISTS idx_circle_comments_post ON circle_comments(post_id);
+CREATE INDEX IF NOT EXISTS idx_circle_post_media_post ON circle_post_media(post_id);
+CREATE INDEX IF NOT EXISTS idx_circle_reports_post ON circle_reports(post_id);
+CREATE INDEX IF NOT EXISTS idx_chat_blacklist_user ON chat_blacklist_entries(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_device_sessions_user ON user_device_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_works_user ON user_works(user_id);
+CREATE INDEX IF NOT EXISTS idx_admin_users_user ON admin_users(user_id);
+CREATE INDEX IF NOT EXISTS idx_saved_square_filters_user ON saved_square_filters(user_id);
 `;
 
 const db = new SqliteStore();

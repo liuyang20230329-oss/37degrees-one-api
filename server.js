@@ -3,10 +3,11 @@
  *
  * 职责：
  * 1. 加载环境变量（dotenv）
- * 2. 初始化 Express 应用及中间件（安全、跨域、日志、JSON 解析）
- * 3. 注册所有业务路由模块（auth / user / chat / circle / square / notifications / reviews / admin / search / upload）
- * 4. 提供 /health 健康检查和 /api/v1/status 状态端点
+ * 2. 初始化 Express 应用及中间件
+ * 3. 注册所有业务路由模块
+ * 4. 提供 /health（含数据库检测）和 /api/v1/status 端点
  * 5. 启动 HTTP 服务并挂载 WebSocket 实时通信服务
+ * 6. 支持 SIGTERM/SIGINT 优雅关闭
  */
 
 require('dotenv').config();
@@ -51,12 +52,24 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: '37degrees-local-api',
-    mode: 'sqlite',
-  });
+/** 健康检查端点（含数据库连接状态检测） */
+app.get('/health', async (_req, res) => {
+  try {
+    await db.get('SELECT 1');
+    res.json({
+      status: 'ok',
+      service: '37degrees-local-api',
+      mode: 'sqlite',
+      database: 'connected',
+    });
+  } catch (_) {
+    res.status(503).json({
+      status: 'degraded',
+      service: '37degrees-local-api',
+      mode: 'sqlite',
+      database: 'disconnected',
+    });
+  }
 });
 
 app.get(`${apiBase}/status`, async (_req, res) => {
@@ -64,7 +77,7 @@ app.get(`${apiBase}/status`, async (_req, res) => {
   res.json({
     status: 'running',
     api: '37degrees-local-api',
-    version: '1.1.0',
+    version: '1.2.0',
     endpoints: {
       auth: `${apiBase}/auth`,
       users: `${apiBase}/users`,
@@ -105,9 +118,11 @@ app.use((error, _req, res, _next) => {
   });
 });
 
+let httpServer = null;
+
 async function start() {
   await db.ready;
-  const server = app.listen(port, () => {
+  httpServer = app.listen(port, () => {
     console.log('='.repeat(60));
     console.log('37° Local API is ready');
     console.log(`HTTP  : http://127.0.0.1:${port}`);
@@ -115,8 +130,33 @@ async function start() {
     console.log(`WS    : ws://127.0.0.1:${port}/ws/chat`);
     console.log('='.repeat(60));
   });
-  realtime.attach(server);
+  realtime.attach(httpServer);
 }
+
+/** 优雅关闭：停止接收新请求 → 关闭 WebSocket → 关闭 HTTP → 关闭数据库 */
+function gracefulShutdown(signal) {
+  console.log(`\nReceived ${signal}, shutting down gracefully...`);
+  if (!httpServer) {
+    process.exit(0);
+  }
+  realtime.close();
+  httpServer.close(() => {
+    db.close().then(() => {
+      console.log('Database connection closed.');
+      process.exit(0);
+    }).catch((error) => {
+      console.error('Error closing database:', error);
+      process.exit(1);
+    });
+  });
+  setTimeout(() => {
+    console.error('Forced shutdown after timeout.');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 function resolvePort(value) {
   if (!value || value.trim().length === 0) {

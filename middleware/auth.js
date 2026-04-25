@@ -11,6 +11,8 @@ const jwt = require('jsonwebtoken');
 
 const JWT_SECRET = process.env.JWT_SECRET || '37degrees-dev-secret';
 
+module.exports.JWT_SECRET = JWT_SECRET;
+
 function signToken(user) {
   return jwt.sign(
     {

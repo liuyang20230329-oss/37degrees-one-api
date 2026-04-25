@@ -103,9 +103,19 @@ router.post('/audio', authenticateToken, upload.single('audio'), (req, res) => {
   });
 });
 
-/** 删除已上传的文件 */
+/** 删除已上传的文件（防止路径遍历攻击） */
 router.delete('/:filename', authenticateToken, (req, res) => {
-  const target = path.join(uploadDirectory, req.params.filename);
+  const filename = path.basename(req.params.filename);
+  if (!filename || filename !== req.params.filename) {
+    res.status(400).json({ error: '文件名不合法。' });
+    return;
+  }
+  const target = path.join(uploadDirectory, filename);
+  const resolved = path.resolve(target);
+  if (!resolved.startsWith(path.resolve(uploadDirectory) + path.sep) && resolved !== path.resolve(uploadDirectory)) {
+    res.status(400).json({ error: '文件名不合法。' });
+    return;
+  }
   if (!fs.existsSync(target)) {
     res.status(404).json({ error: '未找到该文件。' });
     return;
